@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"github.com/grugnog/mangle"
 	"github.com/hgfischer/goconf"
 	_ "github.com/hgfischer/mysql"
 	"io"
@@ -22,10 +23,14 @@ import (
 var (
 	configFile         string
 	dsn                string
+	corpusFile         string
+	corpus             [255][]string
+	secret             string
 	extendedInsertRows int
 	whereMap           = make(map[string]string, 0)
 	selectMap          = make(map[string]map[string]string, 0)
 	filterMap          = make(map[string]string, 0)
+	maskMap            = make(map[string]map[string]string, 0)
 	output             = flag.String("o", "", "Output path. Default is stdout")
 	verboseFlag        = flag.Bool("v", false, "Enable printing status information")
 	debugFlag          = flag.Bool("d", false, "Enable printing of debug information")
@@ -72,6 +77,18 @@ func main() {
 	checkError(err)
 	defer db.Close()
 
+	// Read corpus.
+	corpus, err := mangle.ReadCorpus(corpusFile)
+	checkError(err)
+
+	// Check salt.
+	if len(secret) < 16 {
+		panic("The secret must be at least 16 characters long.")
+	}
+
+	// Initialize mangle.
+	mangler := mangle.Mangle{Corpus: corpus, Secret: secret}
+
 	if *output == "" {
 		w = os.Stdout
 	} else {
@@ -88,16 +105,16 @@ func main() {
 	for _, table := range tables {
 		if filterMap[table] != "ignore" {
 			skipData := filterMap[table] == "nodata"
-			if ! skipData && useTableLock {
+			if !skipData && useTableLock {
 				verbose.Printf("> Locking table %s...\n", table)
 				lockTable(db, table)
 				flushTable(db, table)
 			}
 			verbose.Printf("> Dumping structure for table %s...\n", table)
 			dumpCreateTable(w, db, table)
-			if ! skipData {
+			if !skipData {
 				verbose.Printf("> Dumping data for table %s...\n", table)
-				dumpTableData(w, db, table)
+				dumpTableData(w, db, table, mangler)
 				if useTableLock {
 					verbose.Printf("> Unlocking table %s...\n", table)
 					unlockTables(db)
@@ -149,6 +166,11 @@ func readConfigFile() {
 	checkError(err)
 	useTableLock, err = cfg.GetBool("mysql", "use_table_lock") // return false on error
 
+	corpusFile, err = cfg.GetString("mangle", "corpus")
+	checkError(err)
+	secret, err = cfg.GetString("mangle", "secret")
+	checkError(err)
+
 	selects, err := cfg.GetOptions("select")
 	checkError(err)
 	for _, tablecol := range selects {
@@ -173,6 +195,19 @@ func readConfigFile() {
 	checkError(err)
 	for _, table := range filters {
 		filterMap[table], err = cfg.GetString("filter", table)
+		checkError(err)
+	}
+
+	masks, err := cfg.GetOptions("mask")
+	checkError(err)
+	for _, tablecol := range masks {
+		split := strings.Split(tablecol, ".")
+		table := split[0]
+		column := split[1]
+		if maskMap[table] == nil {
+			maskMap[table] = make(map[string]string, 0)
+		}
+		maskMap[table][column], err = cfg.GetString("mask", tablecol)
 		checkError(err)
 	}
 }
@@ -264,7 +299,7 @@ func getSelectCountQueryFor(db *sql.DB, table string) (query string) {
 }
 
 // Get the table data
-func dumpTableData(w io.Writer, db *sql.DB, table string) {
+func dumpTableData(w io.Writer, db *sql.DB, table string, mangler mangle.Mangle) {
 	fmt.Fprintf(w, "\n--\n-- Data for table `%s`", table)
 
 	var count uint64
@@ -298,17 +333,23 @@ func dumpTableData(w io.Writer, db *sql.DB, table string) {
 		checkError(err)
 
 		vals := make([]string, 0)
-		for _, col := range values {
+		for i, col := range values {
 			val := "NULL"
 			if col != nil {
-				val = fmt.Sprintf("'%s'", escape(string(*col)))
+				if maskMap[table][columns[i]] == "mangle" {
+					valm, err := mangler.MangleString(string(*col))
+					checkError(err)
+					val = fmt.Sprintf("'%s'", escape(valm))
+				} else {
+					val = fmt.Sprintf("'%s'", escape(string(*col)))
+				}
 			}
 			vals = append(vals, val)
 		}
 
 		data = append(data, fmt.Sprintf("( %s )", strings.Join(vals, ", ")))
 		if len(data) >= 100 {
-			fmt.Fprintf(w, "%s\n%s;\n", query, strings.Join(data, ",\n"))
+      fmt.Fprintf(w, "%s\n%s;\n", query, strings.Join(data, ",\n"))
 			data = make([]string, 0)
 		}
 	}
